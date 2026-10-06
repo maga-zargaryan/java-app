@@ -1,0 +1,110 @@
+name: Release
+
+# Pushing tag v<version> (matching pom.xml) builds, tests and publishes the release
+# to the artifacts bucket, then opens a pull request in java-ami that bakes it into
+# a new app AMI. Releases are immutable: an existing version is never overwritten.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: corretto
+          java-version: "21"
+          cache: maven
+
+      - name: Tag must match the project version
+        id: version
+        run: |
+          VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+          if [[ "v$VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pom.xml version $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test
+        run: mvn -B verify
+
+      - name: Package release files
+        working-directory: target
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sha256sum app.jar > app.jar.sha256
+          cat > build-info.json <<EOF
+          {"version": "$VERSION", "commit": "$GITHUB_SHA", "repository": "$GITHUB_REPOSITORY",
+           "run": "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"}
+          EOF
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-release-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload to the artifacts bucket
+        working-directory: target
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BUCKET=$(aws ssm get-parameter --name /java-platform/artifacts_bucket --query Parameter.Value --output text)
+          PREFIX="s3://$BUCKET/java-app/$VERSION"
+          if aws s3api head-object --bucket "$BUCKET" --key "java-app/$VERSION/app.jar" >/dev/null 2>&1; then
+            echo "::error::Release $VERSION already exists; bump the version instead of overwriting it"
+            exit 1
+          fi
+          for f in app.jar app.jar.sha256 build-info.json; do
+            aws s3 cp --only-show-errors "$f" "$PREFIX/$f" --metadata "git-commit=$GITHUB_SHA"
+          done
+          echo "### Released $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$PREFIX/app.jar\` (commit \`$GITHUB_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Token for java-ami
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: java-ami
+
+      - name: Open the image pull request in java-ami
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY_OWNER}/java-ami.git" java-ami
+          cd java-ami
+          BRANCH="release/java-app-$VERSION"
+          git switch -c "$BRANCH"
+          TFVARS=terraform/terraform.tfvars
+          # Bump the recipe patch version: a new release is a recipe change.
+          CURRENT=$(sed -nE 's/^recipe_version *= *"([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' "$TFVARS")
+          NEXT=$(echo "$CURRENT" | awk -F. '{print $1"."$2"."$3+1}')
+          sed -i -E \
+            -e "s/^(app_version *= *)\"[^\"]*\"/\1\"$VERSION\"/" \
+            -e "s/^(app_commit *= *)\"[^\"]*\"/\1\"$GITHUB_SHA\"/" \
+            -e "s/^(recipe_version *= *)\"[^\"]*\"/\1\"$NEXT\"/" "$TFVARS"
+          git -c user.name="java-platform-release[bot]" -c user.email="java-platform-release[bot]@users.noreply.github.com" \
+            commit -qam "Bake java-app $VERSION into the app AMI" -m "Source: $GITHUB_REPOSITORY@$GITHUB_SHA. Recipe $CURRENT -> $NEXT."
+          git push --quiet origin "$BRANCH"
+          gh pr create --repo "${GITHUB_REPOSITORY_OWNER}/java-ami" --head "$BRANCH" \
+            --title "Bake java-app $VERSION into the app AMI" \
+            --body "Release $VERSION from ${GITHUB_REPOSITORY}@${GITHUB_SHA} ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)). Merging builds and tests the app AMI, then opens the dev pull request in java-infra."
