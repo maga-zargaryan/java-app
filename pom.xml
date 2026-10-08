@@ -7,7 +7,7 @@
   <groupId>dev.javaplatform</groupId>
   <artifactId>java-app</artifactId>
   <!-- The release version. A release is the git tag v<version>; CI refuses a mismatch. -->
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <packaging>jar</packaging>
 
   <properties>
