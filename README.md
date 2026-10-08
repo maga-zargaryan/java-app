@@ -10,6 +10,11 @@ and starts the image build.
 
 ## Release flow
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/release.dark.svg">
+  <img alt="Release flow: a java-app version tag publishes an immutable app.jar; a java-ami pull request bakes it into a tested, SHA-tagged AMI; a java-infra pull request pins dev to that AMI ID; another copies it to prod. Rollback reverts ami_id; AMIs in use are never deleted." src="docs/diagrams/release.light.svg">
+</picture>
+
 ```text
 git tag v0.2.0  ──►  Release workflow (this repo)
                        build + test (mvn verify), sha256, build-info.json
